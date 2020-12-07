@@ -1,0 +1,604 @@
+AWSTemplateFormatVersion: "2010-09-09"
+Transform: AWS::Serverless-2016-10-31
+Description: Serverless Sushi Train
+
+Globals:
+  Function:
+    Runtime: python3.8
+    Timeout: 10
+    MemorySize: 256
+    Handler: app.lambda_handler
+    Tracing: Active
+  Api:
+    EndpointConfiguration: REGIONAL
+    Cors: "'*'"
+    TracingEnabled: True
+
+Resources:
+  #############################################################################
+  ## EVENT BUS
+  #############################################################################
+
+  CustomEventBus:
+    Type: AWS::Events::EventBus
+    Properties:
+      Name: !Sub "${AWS::StackName}-eventbus"
+
+  #############################################################################
+  ## ORDERS SERVICE
+  #############################################################################
+
+  CreateMealFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/orders/create_meal
+      Environment:
+        Variables:
+          MEALS_TABLE: !Ref MealsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MealsTable
+      Events:
+        CreateMeal:
+          Type: Api
+          Properties:
+            Path: /meals
+            Method: post
+
+  OrderItemFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/orders/order_item
+      Environment:
+        Variables:
+          MEALS_TABLE: !Ref MealsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MealsTable
+      Events:
+        OrderItem:
+          Type: Api
+          Properties:
+            Path: /meals/{mealId}/items
+            Method: post
+
+  EndMealFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/orders/end_meal
+      Environment:
+        Variables:
+          MEALS_TABLE: !Ref MealsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MealsTable
+      Events:
+        CreateMeal:
+          Type: Api
+          Properties:
+            Path: /meals/{mealId}
+            Method: patch
+
+  MealsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: PK
+          AttributeType: S
+        - AttributeName: SK
+          AttributeType: S
+      KeySchema:
+        - AttributeName: PK
+          KeyType: HASH
+        - AttributeName: SK
+          KeyType: RANGE
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+
+  MealsTableStreamFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/orders/meals_table_stream
+      Environment:
+        Variables:
+          EVENT_BUS: !Ref CustomEventBus
+          MEALS_TABLE: !Ref MealsTable
+      Policies:
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref CustomEventBus
+        - DynamoDBReadPolicy:
+            TableName: !Ref MealsTable
+      Events:
+        MealsTableEvent:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt MealsTable.StreamArn
+            StartingPosition: LATEST
+
+  ItemServedQueue:
+    Type: AWS::SQS::Queue
+
+  ItemServedQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt ItemServedQueue.Arn
+      Queues:
+        - !Ref ItemServedQueue
+
+  RecordDishServedFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/orders/record_dish_served
+      Environment:
+        Variables:
+          MEALS_TABLE: !Ref MealsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref MealsTable
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt ItemServedQueue.Arn
+            BatchSize: 1
+
+  EBItemServedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Send item_served events to the Order Service (track served orders)
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        detail-type:
+          - sushitrain.item_served
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ItemServedQueue.Arn
+          Id: ItemServed-ItemServedQueue
+          InputPath: $.detail
+    DependsOn: CustomEventBus
+
+  #############################################################################
+  ## KITCHEN SERVICE
+  #############################################################################
+
+  EBItemOrderedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Send item_ordered events to the Kitchen Service for dish preparation
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        detail-type:
+          - sushitrain.item_ordered
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt KitchenOrderQueue.Arn
+          Id: ItemOrdered-KitchenOrderQueue
+          InputPath: $.detail
+    DependsOn: CustomEventBus
+
+  KitchenOrderQueue:
+    Type: AWS::SQS::Queue
+
+  KitchenOrderQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt KitchenOrderQueue.Arn
+      Queues:
+        - !Ref KitchenOrderQueue
+
+  HandleOrderFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/kitchen/handle_order
+      Environment:
+        Variables:
+          STATE_MACHINE_ARN: !Ref PrepareDishStateMachine
+      Policies:
+        - StepFunctionsExecutionPolicy:
+            StateMachineName: !GetAtt PrepareDishStateMachine.Name
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt KitchenOrderQueue.Arn
+            BatchSize: 1
+
+  PrepareDishStateMachine:
+    Type: AWS::Serverless::StateMachine
+    TimeoutSeconds: 300
+    Properties:
+      Definition:
+        StartAt: CalculatePrepTime
+        States:
+          CalculatePrepTime:
+            Type: Task
+            Resource: !GetAtt CalculatePrepTimeFunction.Arn
+            Parameters:
+              order:
+                itemName.$: $.order.itemName
+                itemQty.$: $.order.itemQty
+            ResultPath: $.prepTimeSeconds
+            Next: PrepareDish
+          PrepareDish:
+            Type: Wait
+            SecondsPath: $.prepTimeSeconds
+            Next: ServeDish
+          ServeDish:
+            Type: Task
+            Resource: !GetAtt ServeDishFunction.Arn
+            End: true
+      Policies:
+        - LambdaInvokePolicy:
+            FunctionName: !Ref CalculatePrepTimeFunction
+        - LambdaInvokePolicy:
+            FunctionName: !Ref ServeDishFunction
+
+  CalculatePrepTimeFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/kitchen/calculate_prep_time
+      Environment:
+        Variables:
+          MIN_PREP_TIME_SEC: 10
+          MAX_PREP_TIME_SEC: 40
+
+  ServeDishFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/kitchen/serve_dish
+      Environment:
+        Variables:
+          EVENT_BUS: !Ref CustomEventBus
+      Policies:
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref CustomEventBus
+
+  #############################################################################
+  ## BILLING SERVICE
+  #############################################################################
+
+  EBMealFinishedRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Send meal_finished events to the Billing Service (for invoicing, payment)
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        detail-type:
+          - sushitrain.meal_finished
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt BillingMealQueue.Arn
+          Id: MealFinished-BillingMealQueue
+          InputPath: $.detail
+    DependsOn: CustomEventBus
+
+  BillingMealQueue:
+    Type: AWS::SQS::Queue
+
+  BillingMealQueuePolicy:
+    Type: AWS::SQS::QueuePolicy
+    Properties:
+      PolicyDocument:
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sqs:SendMessage
+            Resource: !GetAtt BillingMealQueue.Arn
+      Queues:
+        - !Ref BillingMealQueue
+
+  BillMealFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/billing/bill_meal
+      Environment:
+        Variables:
+          BILLING_TABLE: !Ref BillingTable
+          ORDER_FREE_THRESHOLD_SEC: 30
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref BillingTable
+      Events:
+        SQSEvent:
+          Type: SQS
+          Properties:
+            Queue: !GetAtt BillingMealQueue.Arn
+            BatchSize: 1
+
+  BillingTableStreamFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/billing/billing_table_stream
+      Environment:
+        Variables:
+          EVENT_BUS: !Ref CustomEventBus
+      Policies:
+        - EventBridgePutEventsPolicy:
+            EventBusName: !Ref CustomEventBus
+      Events:
+        BillingTableEvent:
+          Type: DynamoDB
+          Properties:
+            Stream: !GetAtt BillingTable.StreamArn
+            StartingPosition: LATEST
+
+  BillingTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: mealId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: mealId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+      StreamSpecification:
+        StreamViewType: NEW_IMAGE
+
+  #############################################################################
+  ## NOTIFICATIONS SERVICE
+  #############################################################################
+
+  WebSocketAPI:
+    Type: AWS::ApiGatewayV2::Api
+    Properties:
+      Name: !Sub "${AWS::StackName}-WebSocket"
+      ProtocolType: WEBSOCKET
+      RouteSelectionExpression: "$request.body.action"
+
+  WebSocketDeployment:
+    Type: AWS::ApiGatewayV2::Deployment
+    DependsOn:
+      - ConnectWebSocketRoute
+    Properties:
+      ApiId: !Ref WebSocketAPI
+
+  WebSocketStage:
+    Type: AWS::ApiGatewayV2::Stage
+    Properties:
+      StageName: Prod
+      Description: Prod Stage
+      DeploymentId: !Ref WebSocketDeployment
+      ApiId: !Ref WebSocketAPI
+
+  ConnectWebSocketRoute:
+    Type: AWS::ApiGatewayV2::Route
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      RouteKey: $connect
+      AuthorizationType: NONE
+      OperationName: ConnectRoute
+      Target: !Join
+        - "/"
+        - - "integrations"
+          - !Ref ConnectWebSocketIntegration
+
+  ConnectWebSocketIntegration:
+    Type: AWS::ApiGatewayV2::Integration
+    Properties:
+      ApiId: !Ref WebSocketAPI
+      Description: Connect Integration
+      IntegrationType: AWS_PROXY
+      IntegrationUri: !Sub arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${WebSocketConnectFunction.Arn}/invocations
+
+  EBNotificationRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Send item_served, meal_billed events to Notification Service
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        detail-type:
+          - sushitrain.item_served
+          - sushitrain.meal_billed
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt WebSocketNotifyUserFunction.Arn
+          Id: WSNotifyUser
+    DependsOn: CustomEventBus
+
+  WebSocketConnectFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/notifications/websocket_connect
+      Environment:
+        Variables:
+          WEBSOCKETS_TABLE: !Ref WebSocketsTable
+      Policies:
+        - DynamoDBCrudPolicy:
+            TableName: !Ref WebSocketsTable
+
+  WebSocketConnectFunctionPermission:
+    Type: AWS::Lambda::Permission
+    DependsOn:
+      - WebSocketAPI
+    Properties:
+      Action: lambda:InvokeFunction
+      FunctionName: !Ref WebSocketConnectFunction
+      Principal: apigateway.amazonaws.com
+
+  WebSocketNotifyUserFunction:
+    Type: AWS::Serverless::Function
+    Properties:
+      CodeUri: functions/notifications/websocket_notify
+      Environment:
+        Variables:
+          WEBSOCKETS_TABLE: !Ref WebSocketsTable
+          WS_CONNECTION_URL: !Sub https://${WebSocketAPI}.execute-api.${AWS::Region}.amazonaws.com/${WebSocketStage}/@connections/
+      Policies:
+        - DynamoDBReadPolicy:
+            TableName: !Ref WebSocketsTable
+        - Statement:
+            - Effect: Allow
+              Action: "execute-api:ManageConnections"
+              Resource: !Sub "arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${WebSocketAPI}/*"
+
+  WebSocketNotifyLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref WebSocketNotifyUserFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt EBNotificationRule.Arn
+
+  WebSocketsTable:
+    Type: AWS::DynamoDB::Table
+    Properties:
+      AttributeDefinitions:
+        - AttributeName: mealId
+          AttributeType: S
+      KeySchema:
+        - AttributeName: mealId
+          KeyType: HASH
+      BillingMode: PAY_PER_REQUEST
+
+  #############################################################################
+  ## FIREHOSE S3 ARCHIVE
+  #############################################################################
+
+  EBMatchAllFirehoseRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Catchall rule to send all events to Kinesis Firehose
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source:
+          - prefix: ""
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt KinesisFirehose.Arn
+          Id: MatchAll-KDF
+          RoleArn: !GetAtt EBFirehoseRole.Arn
+    DependsOn: CustomEventBus
+
+  KinesisFirehose:
+    Type: AWS::KinesisFirehose::DeliveryStream
+    Properties:
+      ExtendedS3DestinationConfiguration:
+        BucketARN: !GetAtt FirehoseBucket.Arn
+        BufferingHints:
+          IntervalInSeconds: 60
+          SizeInMBs: 5
+        RoleARN: !GetAtt FirehoseDeliveryRole.Arn
+
+  FirehoseDeliveryRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: firehose.amazonaws.com
+            Action: sts:AssumeRole
+
+  FirehoseDeliveryIAMPolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-KDFS3AccessPolicy"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - s3:AbortMultipartUpload
+              - s3:GetBucketLocation
+              - s3:GetObject
+              - s3:ListBucket
+              - s3:ListBucketMultipartUploads
+              - s3:PutObject
+            Resource:
+              - !GetAtt FirehoseBucket.Arn
+              - !Sub "${FirehoseBucket.Arn}/*"
+      Roles:
+        - !Ref FirehoseDeliveryRole
+
+  FirehoseBucket:
+    Type: AWS::S3::Bucket
+
+  EBFirehoseRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: events.amazonaws.com
+            Action: sts:AssumeRole
+
+  EBFirehosePolicy:
+    Type: AWS::IAM::Policy
+    Properties:
+      PolicyName: !Sub "${AWS::StackName}-EBFirehosePolicy"
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Effect: Allow
+            Action:
+              - firehose:PutRecord
+              - firehose:PutRecordBatch
+            Resource: !GetAtt KinesisFirehose.Arn
+      Roles:
+        - !Ref EBFirehoseRole
+
+  #############################################################################
+  ## LOGGING
+  #############################################################################
+
+  EventBusLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub "/aws/events/${AWS::StackName}/all-events"
+      RetentionInDays: 7
+
+  EBMatchAllLogRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Description: Catchall rule to send all events to CloudWatch Logs
+      EventBusName: !Ref CustomEventBus
+      EventPattern:
+        source:
+          - prefix: ""
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt EventBusLogGroup.Arn
+          Id: MatchAll-LogGroup
+    DependsOn: CustomEventBus
+
+  #############################################################################
+  ## STATIC WEBSITE
+  #############################################################################
+
+  StaticWebBucket:
+    Type: AWS::S3::Bucket
+
+Outputs:
+  RestApiURL:
+    Description: "REST API URL"
+    Value: !Sub "https://${ServerlessRestApi}.execute-api.${AWS::Region}.amazonaws.com/Prod"
+  WebSocketURL:
+    Description: "WebSocket URL"
+    Value: !Sub "wss://${WebSocketAPI}.execute-api.${AWS::Region}.amazonaws.com/${WebSocketStage}"
+  StaticWebBucket:
+    Description: "Website S3 Bucket"
+    Value: !Ref StaticWebBucket
+  WebsiteURL:
+    Description: "Website URL"
+    Value: !Sub "https://${StaticWebBucket}.s3-${AWS::Region}.amazonaws.com/index.html"
+  EventLogGroup:
+    Description: All Events Log Group
+    Value: !Ref EventBusLogGroup

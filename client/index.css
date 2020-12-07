@@ -1,0 +1,47 @@
+body {
+    font-size: 1.2em;
+    padding: 30px;
+}
+
+#seatDiv {
+    float: right;
+    padding-top: 20px;
+}
+
+#mealNumDiv {
+    padding-top: 20px;
+}
+
+#mealOrderDiv {
+    padding-top: 20px;
+    display: none;
+}
+
+#menuItemsDiv button {
+    width: 200px;
+    margin: 5px;
+}
+
+#orderedItemsDiv {
+    padding: 10px;
+    padding-top: 20px;
+}
+
+td .progress {
+    margin-top: 9px;
+    margin-left: 50px;
+    width: 100px;
+}
+
+.itemStatus {
+    float: left;
+}
+
+#paymentAlert {
+    display: none;
+}
+
+#billingProgress {
+    display: none;
+    width: 100%;
+}
